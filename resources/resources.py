@@ -34,6 +34,8 @@ DIRTOOLS  = 'NiftyPET_tools'
 MSVC_VRSN = 'Visual Studio 12 2013 Win64'
 CMAKE_TLS_PAR = '' #-DUSE_SSE=OFF'
 # PATHTOOLS = os.path.join('/chosen/path/', DIRTOOLS)
+#> path to Python wrapper of Vinci
+VINCIPATH = ''
 # -----------------------------------------------------
 
 # -----------------------------------------------------
@@ -50,6 +52,8 @@ CMAKE_TLS_PAR = '' #-DUSE_SSE=OFF'
 ENBLXNAT = False
 # enable Agg
 ENBLAGG = False
+# compile DCM2NIIX, otherwise download a compiled version for the system used
+CMPL_DCM2NIIX = False
 
 #============ SIEMENS mMR SCANNER C O N S T A N T S ===============
 # number of rings (axially) and crystals (transaxially)
@@ -267,9 +271,11 @@ def get_setup(Cnt = {}):
     if 'DCM2NIIX'   in globals() and DCM2NIIX!='':      Cnt['DCM2NIIX'] = DCM2NIIX
     # hardware mu-maps
     if 'HMUDIR'     in globals() and HMUDIR!='':        Cnt['HMUDIR']   = HMUDIR
+    if 'VINCIPATH'  in globals() and VINCIPATH!='':     Cnt['VINCIPATH'] = VINCIPATH
 
     Cnt['ENBLXNAT'] = ENBLXNAT
     Cnt['ENBLAGG'] = ENBLAGG
+    Cnt['CMPL_DCM2NIIX'] = CMPL_DCM2NIIX
 
     return Cnt
 
@@ -358,6 +364,7 @@ def get_mmr_constants():
 
 
         'BTP':0, #1:non parametric bootstrap, 2: parametric bootstrap (recommended)
+        'BTPRT':1.0, # Ratio of bootstrapped/original events (enables downsampling)
 
         'VERBOSE':False,
 

@@ -8,6 +8,7 @@ __copyright__ = "Copyright 2018"
 import numpy as np
 import sys
 import os
+import platform
 import shutil
 import scipy.ndimage as ndi
 import nibabel as nib
@@ -19,19 +20,50 @@ import re
 import multiprocessing
 
 from pkg_resources import resource_filename
+
 import imio
-import improc
+import regseg
+
+import resources as rs
+
+#> GPU routines only on Linux and Windows
+if 'compute' in rs.CC_ARCH and platform.system() in ['Linux', 'Windows']:
+    import improc
+
+sitk_flag = True
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk_flag = False
+
+# possible extentions for DICOM files
+dcmext = ('dcm', 'DCM', 'ima', 'IMA')
+
+niiext = ('nii.gz', 'nii', 'img', 'hdr')
+
+#>--------------------------
+def num(s):
+    ''' Converts the string to a float or integer number.
+    '''
+    try:
+        return int(s)
+    except ValueError:
+        return float(s)
+#>--------------------------
 
 # <><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
 # FUNCTIONS: T R I M   &   P A R T I A L   V O L U M E   E F F E C T S   A N D   C O R R E C T I O N
 # <><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
 
-def trimim( fims, 
+def trimim( fims,
+
+            refim = '',
             affine=None,
             scale=2,
             divdim = 8**2,
-            int_order=0,
             fmax = 0.05,
+            
+            int_order=0,
             outpath='',
             fname='',
             fcomment='',
@@ -51,6 +83,8 @@ def trimim( fims,
     4. as a 3D or 4D image
     Parameters:
     -----------
+    refim:  Path to the reference image, which was already trimmed.
+            Needs the trimming parameters stored in the NIfTI header in 'descrip'. 
     affine: affine matrix, 4x4, for all the input images in case when images
             passed as a matrix (all have to have the same shape and data type)
     scale: the scaling factor for upsampling has to be greater than 1
@@ -67,19 +101,25 @@ def trimim( fims,
     verbose: verbose mode [True/False]
     '''
 
+    using_multiple_files = False
+
     # case when input folder is given
     if isinstance(fims, basestring) and os.path.isdir(fims):
         # list of input images (e.g., PET)
-        fimlist = [os.path.join(fims,f) for f in os.listdir(fims) if f.endswith('.nii') or f.endswith('.nii.gz')]
-        imdic = imio.niisort(fimlist)
-        imin = imdic['im']
+        fimlist = [os.path.join(fims,f) for f in os.listdir(fims) if f.endswith(niiext)]
+        imdic = imio.niisort(fimlist, memlim=memlim)
+        if not (imdic['N']>50 and memlim):
+            imin = imdic['im']
         imshape = imdic['shape']
         affine = imdic['affine']
         fldrin = fims
         fnms = [os.path.basename(f).split('.nii')[0] for f in imdic['files'] if f!=None]
+        # number of images/frames
+        Nim = imdic['N']
+        using_multiple_files = True
 
     # case when input file is a 3D or 4D NIfTI image
-    elif isinstance(fims, basestring) and os.path.isfile(fims) and (fims.endswith('nii') or fims.endswith('nii.gz')):
+    elif isinstance(fims, basestring) and os.path.isfile(fims) and fims.endswith(niiext):
         imdic = imio.getnii(fims, output='all')
         imin = imdic['im']
         if imin.ndim==3:
@@ -89,15 +129,22 @@ def trimim( fims,
         affine = imdic['affine']
         fldrin = os.path.dirname(fims)
         fnms = imin.shape[0] * [ os.path.basename(fims).split('.nii')[0] ]
+        # number of images/frames
+        Nim = imin.shape[0]
 
     # case when a list of input files is given
     elif isinstance(fims, list) and all([os.path.isfile(k) for k in fims]):
-        imdic = imio.niisort(fims)
-        imin = imdic['im']
+        imdic = imio.niisort(fims, memlim=memlim)
+        if not (imdic['N']>50 and memlim):
+            imin = imdic['im']
         imshape = imdic['shape']
         affine = imdic['affine']
+        imdtype = imdic['dtype']
         fldrin = os.path.dirname(fims[0])
         fnms = [os.path.basename(f).split('.nii')[0] for f in imdic['files']]
+        # number of images/frames
+        Nim = imdic['N']
+        using_multiple_files = True
 
     # case when an array [#frames, zdim, ydim, xdim].  Can be 3D or 4D
     elif isinstance(fims, (np.ndarray, np.generic)) and (fims.ndim==4 or fims.ndim==3):
@@ -114,12 +161,28 @@ def trimim( fims,
             fnms = imin.shape[0] * [ 'NIMPA' ]
         else:
             fnms = imin.shape[0] * [ fname ]
+        # number of images/frames
+        Nim = imin.shape[0]
 
     else:
         raise TypeError('Wrong data type input.')
 
-    # number of images/frames
-    Nim = imin.shape[0]
+
+    #> if using reference trimmed image:
+    ref_flag = False
+    if os.path.isfile(refim):
+        refdct = imio.getnii(refim, output='all')
+        nii_descrp = refdct['hdr']['descrip'].item()
+        if 'trim' in nii_descrp:
+            #> find all the numbers (int and floats)
+            parstr = re.findall(r'-*\d+\.*\d*', nii_descrp)
+            ix0, ix1, iy0, iy1, iz0, scale, fmax = (num(s) for s in parstr)
+            ref_flag = True
+            print 'i> using the trimming parameters of the reference image.'
+        else:
+            print 'w> the reference image does not contain trimming info--using default.'
+
+    
 
     #-------------------------------------------------------
     # store images in this folder
@@ -154,7 +217,13 @@ def trimim( fims,
                 imsum += imscl[i,:,:,:]
         else:
             for i in range(Nim):
-                imsum += ndi.interpolation.zoom(imin[i,:,:,:], (scale, scale, scale), order=0 )
+                if Nim>50 and using_multiple_files:
+                    imin_temp = imio.getnii(imdic['files'][i])
+                    imsum += ndi.interpolation.zoom(imin_temp, (scale, scale, scale), order=int_order )
+                    if verbose:
+                        print 'i> image sum: read', imdic['files'][i]
+                else:
+                    imsum += ndi.interpolation.zoom(imin[i,:,:,:], (scale, scale, scale), order=int_order )
     else:
         imscl = imin
         imsum = np.sum(imin, axis=0)
@@ -163,38 +232,39 @@ def trimim( fims,
     #imsum = ndi.filters.gaussian_filter(imsum, imio.fwhm2sig(4.0, voxsize=abs(affine[0,0])), mode='mirror')
     #-------------------------------------------------------
    
-    # find the object bounding indexes in x, y and z axes, e.g., ix0-ix1 for the x axis
-    qx = np.sum(imsum, axis=(0,1))
-    ix0 = np.argmax( qx>(fmax*np.nanmax(qx)) )
-    ix1 = ix0+np.argmin( qx[ix0:]>(fmax*np.nanmax(qx)) )
+    if not ref_flag:
+        # find the object bounding indexes in x, y and z axes, e.g., ix0-ix1 for the x axis
+        qx = np.sum(imsum, axis=(0,1))
+        ix0 = np.argmax( qx>(fmax*np.nanmax(qx)) )
+        ix1 = ix0+np.argmin( qx[ix0:]>(fmax*np.nanmax(qx)) )
 
-    qy = np.sum(imsum, axis=(0,2))
-    iy0 = np.argmax( qy>(fmax*np.nanmax(qy)) )
-    iy1 = iy0+np.argmin( qy[iy0:]>(fmax*np.nanmax(qy)) )
+        qy = np.sum(imsum, axis=(0,2))
+        iy0 = np.argmax( qy>(fmax*np.nanmax(qy)) )
+        iy1 = iy0+np.argmin( qy[iy0:]>(fmax*np.nanmax(qy)) )
 
-    qz = np.sum(imsum, axis=(1,2))
-    iz0 = np.argmax( qz>(fmax*np.nanmax(qz)) )
+        qz = np.sum(imsum, axis=(1,2))
+        iz0 = np.argmax( qz>(fmax*np.nanmax(qz)) )
 
-    # find the maximum voxel range for x and y axes
-    IX = ix1-ix0+1
-    IY = iy1-iy0+1
-    tmp = max(IX, IY)
-    #> get the range such that it is divisible by 
-    #> divdim (64 by default) for GPU execution
-    IXY = divdim * ((tmp+divdim-1)/divdim)
-    div = (IXY-IX)/2
-    # x
-    ix0 -= div
-    ix1 += (IXY-IX)-div
-    # y
-    div = (IXY-IY)/2
-    iy0 -= div
-    iy1 += (IXY-IY)-div
-    # z
-    tmp = (len(qz)-iz0+1)
-    IZ = divdim * ((tmp+divdim-1)/divdim)
-    iz0 -= IZ-tmp+1
-    
+        # find the maximum voxel range for x and y axes
+        IX = ix1-ix0+1
+        IY = iy1-iy0+1
+        tmp = max(IX, IY)
+        #> get the range such that it is divisible by 
+        #> divdim (64 by default) for GPU execution
+        IXY = divdim * ((tmp+divdim-1)/divdim)
+        div = (IXY-IX)/2
+        # x
+        ix0 -= div
+        ix1 += (IXY-IX)-div
+        # y
+        div = (IXY-IY)/2
+        iy0 -= div
+        iy1 += (IXY-IY)-div
+        # z
+        tmp = (len(qz)-iz0+1)
+        IZ = divdim * ((tmp+divdim-1)/divdim)
+        iz0 -= IZ-tmp+1
+        
     # save the trimming parameters in a dic
     trimpar = {'x':(ix0, ix1), 'y':(iy0, iy1), 'z':(iz0), 'fmax':fmax}
 
@@ -224,10 +294,21 @@ def trimim( fims,
         print '-----------------------------------------------------------------'
         print 'w> Correcting for trimming outside the original image (x-axis)'
         print '-----------------------------------------------------------------'
+    
+
+    #> in case the upper index goes beyond the scaled but untrimmed image
+    iy1t = imsumt.shape[1]
+    if iy1>=imsum.shape[1]:
+        iy1t -= iy1+1
+
+    #> the same for x
+    ix1t = imsumt.shape[2]
+    if ix1>=imsum.shape[2]:
+        ix1t -= ix1+1
 
 
     # first trim the sum image
-    imsumt[iz0t:, iy0t:, ix0t: ] = imsum[iz0s:, iy0s:iy1+1, ix0s:ix1+1]
+    imsumt[iz0t:, iy0t:iy1t, ix0t:ix1t] = imsum[iz0s:, iy0s:iy1+1, ix0s:ix1+1]
 
     #> new affine matrix for the scaled and trimmed image
     A = np.diag(sf*np.diag(affine))
@@ -242,7 +323,7 @@ def trimim( fims,
     dctout = {'affine': A, 'trimpar':trimpar, 'imsum':imsumt}
 
     # NIfTI image description (to be stored in the header)
-    niidescr = 'trimm(x,y,z):' \
+    niidescr = 'trim(x,y,z):' \
                + str(trimpar['x'])+',' \
                + str(trimpar['y'])+',' \
                + str((trimpar['z'],)) \
@@ -263,24 +344,30 @@ def trimim( fims,
 
         # memory saving option, second time doing interpolation
         if memlim:
-            im = ndi.interpolation.zoom(imin[i,:,:,:], (scale, scale, scale), order=int_order )
+            if Nim>50 and using_multiple_files:
+                    imin_temp = imio.getnii(imdic['files'][i])
+                    im = ndi.interpolation.zoom(imin_temp, (scale, scale, scale), order=int_order )
+                    if verbose:
+                        print 'i> image scaling:', imdic['files'][i]
+            else:
+                im = ndi.interpolation.zoom(imin[i,:,:,:], (scale, scale, scale), order=int_order )
         else:
             im = imscl[i,:,:,:]
 
         # trim the scaled image
-        imtrim[i, iz0t:, iy0t:, ix0t: ] = im[iz0s:, iy0s:iy1+1, ix0s:ix1+1]
+        imtrim[i, iz0t:, iy0t:iy1t, ix0t:ix1t] = im[iz0s:, iy0s:iy1+1, ix0s:ix1+1]
         
         # save the up-sampled and trimmed PET images
         if store_img_intrmd:
             _frm = '_trmfrm'+str(i)
             _fstr = '_trimmed-upsampled-scale-'+str(scale) + _frm*(Nim>1) +fcomment
-            fpetu.append( os.path.join(petudir, fnms[i]+_fstr+'.nii.gz') )
+            fpetu.append( os.path.join(petudir, fnms[i]+_fstr+'_i.nii.gz') )
             imio.array2nii( imtrim[i,::-1,::-1,:], A, fpetu[i], descrip=niidescr)
             if verbose:  print 'i> saved upsampled PET image to:', fpetu[i]
 
     if store_img:
         _nfrm = '_nfrm'+str(Nim)
-        fim = os.path.join(petudir, 'final_trimmed-upsampled-scale-'+str(scale))+_nfrm*(Nim>1)+fcomment+'.nii.gz'
+        fim = os.path.join(petudir, 'trimmed-upsampled-scale-'+str(scale))+_nfrm*(Nim>1)+fcomment+'.nii.gz'
         imio.array2nii( np.squeeze(imtrim[:,::-1,::-1,:]), A, fim, descrip=niidescr)
         dctout['fim'] = fim
 
@@ -332,7 +419,7 @@ def psf_measured(scanner='mmr', scale=1):
     if scanner=='mmr':
         # file name for the mMR's PSF and chosen scale
         fnm = 'PSF-17_scl-'+str(int(scale))+'.npy'
-        fpth = resource_filename('niftypet', 'auxdata')
+        fpth = resource_filename(__name__, '../../auxdata')
         fdat = os.path.join(fpth, fnm)
         # cdir = os.path.dirname(resource_filename(__name__, __file__))
         # niftypet_dir = os.path.dirname(os.path.dirname(cdir))
@@ -373,10 +460,22 @@ def iyang(imgIn, krnl, imgSeg, Cnt, itr=5):
         imgPWC[imgPWC<0] = 0
         for jr in range(0,m+1):
             imgPWC[imgSeg==jr] = np.mean( imgPWC[imgSeg==jr] )
-        # blur the piece-wise constant image
-        imgSmo = np.zeros(imgIn.shape, dtype=np.float32)
-        # convolution on GPU with separable kernel (x,y,z):
-        improc.convolve(imgSmo, imgPWC, krnl, Cnt)
+        
+        #> blur the piece-wise constant image using either:
+        #> (1) GPU convolution with a separable kernel (x,y,z), or
+        #> (2) CPU, Python-based convolution
+        if 'CCARCH' in Cnt and 'compute' in Cnt['CCARCH']:
+
+            #> convert to dimensions of GPU processing [y,x,z]
+            imin_d = np.transpose(imgPWC, (1, 2, 0))
+            imout_d = np.zeros(imin_d.shape, dtype=np.float32)
+            improc.convolve(imout_d, imin_d, krnl, Cnt)
+            imgSmo = np.transpose(imout_d, (2,0,1))
+        else:
+            hxy = np.outer(krnl[1,:], krnl[2,:])
+            hxyz = np.multiply.outer(krnl[0,:], hxy)
+            imgSmo = ndi.convolve(imgPWC, hxyz, mode='constant', cval=0.)
+        
         # correction factors
         imgCrr = np.ones(dim, dtype=np.float32)
         imgCrr[imgSmo>0] = imgPWC[imgSmo>0] / imgSmo[imgSmo>0]
@@ -392,17 +491,19 @@ def iyang(imgIn, krnl, imgSeg, Cnt, itr=5):
 # G E T   P A R C E L L A T I O N S   F O R   P V C   A N D   R O I   E X T R A C T I O N
 # ------------------------------------------------------------------------------------------------------
 def pvc_iyang(
-    petin,
-    mridct,
-    Cnt,
-    pvcroi,
-    krnl,
-    itr=5,
-    tool='nifty',
-    faff='',
-    outpath='',
-    fcomment='',
-    store_img=False,
+        petin,
+        mridct,
+        Cnt,
+        pvcroi,
+        krnl,
+        itr=5,
+        tool='niftyreg',
+        faff='',
+        outpath='',
+        fcomment='',
+        store_img=False,
+        store_rois=False,
+        matlab_eng = ''
     ):
     ''' Perform partial volume (PVC) correction of PET data (petin) using MRI data (mridct).
         The PVC method uses iterative Yang method.
@@ -461,89 +562,150 @@ def pvc_iyang(
     if not os.path.isfile(mridct['T1lbl']):
         raise NameError('MissingLabels')
 
-    # path to labels of brain parcellations in NIfTI format
-    lbpth = os.path.split(mridct['T1lbl'])
+    #> output dictionary
+    outdct = {}
+
+    # establish the output folder
+    if outpath=='':        
+        prcl_dir = os.path.dirname(mridct['T1lbl'])
+        pvc_dir =  os.path.join(os.path.dirname(fpet), 'PVC')
+    else:
+        prcl_dir = outpath
+        pvc_dir =  os.path.join(os.path.dirname(fpet), 'PVC')
+
+    #> create folders
+    imio.create_dir(prcl_dir)
+    imio.create_dir(pvc_dir)
+    if store_rois:
+        rois_dir = os.path.join(pvc_dir, 'ROIs')
+        imio.create_dir(rois_dir)
 
     #==================================================================
     #if affine transf. (faff) is given then take the T1 and resample it too.
     if isinstance(faff, basestring) and not os.path.isfile(faff):
         # faff is not given; get it by running the affine; get T1w to PET space
-        faff, _ = reg_mr2pet(fpet, mridct, Cnt, outpath=outpath, fcomment=fcomment)
 
-    # establish the output folder
-    if outpath=='':        
-        prcl_dir = os.path.dirname(mridct['T1lbl'])
+        ft1w = imio.pick_t1w(mridct)
+
+        if tool=='spm':
+            regdct = regseg.coreg_spm(
+                fpet,
+                ft1w,
+                fcomment = fcomment,
+                outpath=os.path.join(outpath,'PET', 'positioning')
+            )
+            #> save Matlab engine for later resampling
+            matlab_eng = regdct['matlab_eng']
+
+        elif tool=='niftyreg':
+            regdct = regseg.affine_niftyreg(
+                fpet,
+                ft1w,
+                outpath=os.path.join(outpath,'PET', 'positioning'),
+                fcomment = fcomment,
+                executable = Cnt['REGPATH'],
+                omp = multiprocessing.cpu_count()/2,
+                rigOnly = True,
+                affDirect = False,
+                maxit=5,
+                speed=True,
+                pi=50, pv=50,
+                smof=0, smor=0,
+                rmsk=True,
+                fmsk=True,
+                rfwhm=15., #millilitres
+                rthrsh=0.05,
+                ffwhm = 15., #millilitres
+                fthrsh=0.05,
+                verbose=Cnt['VERBOSE']
+            )
+        faff = regdct['faff']
     else:
-        prcl_dir = outpath
-        imio.create_dir(prcl_dir)
+        if tool=='spm' and matlab_eng == '':
+            print 'i> starting Matlab for SPM...'
+            import matlab.engine
+            matlab_eng = matlab.engine.start_matlab()
+
 
     # resample the GIF T1/labels to upsampled PET
-    if tool=='nifty':
-        # file name of the parcellation (GIF-based) upsampled to PET
-        fgt1u = os.path.join(prcl_dir, os.path.basename(mridct['T1lbl']).split('.')[0]+'_registered_trimmed'+fcomment+'.nii.gz')
+    # file name of the parcellation (GIF-based) upsampled to PET
+    fgt1u = os.path.join(
+            prcl_dir,
+            os.path.basename(mridct['T1lbl']).split('.')[0]\
+            +'_registered_trimmed'+fcomment+'.nii.gz')
+        
+    if tool=='niftyreg':
         if os.path.isfile( Cnt['RESPATH'] ):
             cmd = [Cnt['RESPATH'],  '-ref', fpet,  '-flo', mridct['T1lbl'],
                    '-trans', faff, '-res', fgt1u, '-inter', '0']
             if not Cnt['VERBOSE']: cmd.append('-voff')
             call(cmd)
         else:
-            print 'e> path to resampling executable is incorrect!'
-            sys.exit()
+            raise IOError('e> path to resampling executable is incorrect!')
         
     elif tool=='spm':
-        fgt1u = spm_resample(  fpet, mridct['T1lbl'], faff, 
-                                intrp=0, dirout=prcl_dir, r_prefix='r_trimmed_'+fcomment, 
-                                del_ref_uncmpr=True, del_flo_uncmpr=True, del_out_uncmpr=True)
+        fout = regseg.resample_spm(
+                    fpet,
+                    mridct['T1lbl'],
+                    faff,
+                    fimout = fgt1u,
+                    matlab_eng = matlab_eng,
+                    intrp = 0.,
+                    del_ref_uncmpr = True,
+                    del_flo_uncmpr = True,
+                    del_out_uncmpr = True,
+            )
 
     #==================================================================
 
-    # Get the labels before resampling to PET space, so that the regions can be separated for the PET space
-    nilb = nib.load(mridct['T1lbl'])
-    A = nilb.get_sform()
-    imlb = nilb.get_data()
+    # Get the parcellation labels in the upsampled PET space
+    dprcl = imio.getnii(fgt1u, output='all')
+    prcl = dprcl['im']
 
-    # ===============================================================
-    # get the segmentation/parcellation for PVC
-    # create and reset the image for parcellation
-    imgroi = np.copy(imlb);  imgroi[:] = 0
-    # number of segments, without the background
+    #> path to parcellations in NIfTI format
+    prcl_pth = os.path.split(mridct['T1lbl'])
+
+    #---------------------------------------------------------------------------
+    #> get the parcellation specific for PVC based on the current parcellations
+    imgroi = prcl.copy();  imgroi[:] = 0
+    
+    #> number of segments, without the background
     nSeg = len(pvcroi)
-    # create the image of numbered parcellations/segmentations
+    
+    #> create the image of numbered parcellations
     for k in range(nSeg):
         for m in pvcroi[k]:
-            imgroi[imlb==m] = k+1
-    # create the NIfTI image
-    froi1 = os.path.join(prcl_dir, lbpth[1].split('.')[0][:8]+'_pvcroi_'+fcomment+'.nii.gz')
-    niiSeg = nib.Nifti1Image(imgroi, A)
-    niiSeg.header['cal_max'] = np.max(imgroi)
-    niiSeg.header['cal_min'] = 0.
-    nib.save(niiSeg, froi1)
-    if tool=='nifty':
-        froi2 = os.path.join(prcl_dir, lbpth[1].split('.')[0][:8]+'_pvcroi_registered_trimmed_'+fcomment+'.nii.gz')
-        if os.path.isfile( Cnt['RESPATH'] ):
-            cmd = [Cnt['RESPATH'], '-ref', fpet, '-flo', froi1, '-trans', faff,  '-res', froi2,  '-inter', '0']
-            if not Cnt['VERBOSE']: cmd.append('-voff')       
-            call(cmd)
-        else:
-            print 'e> path to resampling executable is incorrect!'
-            sys.exit()
-    elif tool=='spm':
-        froi2 = spm_resample(
-            fpet, froi1, faff, 
-            intrp=0, dirout=prcl_dir, r_prefix='r_'+fcomment+'pvcroi_registered_', 
-            del_ref_uncmpr=True, del_flo_uncmpr=True, del_out_uncmpr=True
-        )
-    # -----------------------------------
-    imgroi2 = imio.getnii(froi2)
+            imgroi[prcl==m] = k+1
+
+    #> save the PCV ROIs to a new NIfTI file
+    if store_rois:
+        froi = os.path.join(rois_dir, prcl_pth[1].split('.nii')[0]+'_PVC-ROIs-inPET.nii.gz')
+        imio.array2nii(
+            imgroi,
+            dprcl['affine'],
+            froi,
+            trnsp = (dprcl['transpose'].index(0),
+                     dprcl['transpose'].index(1),
+                     dprcl['transpose'].index(2)),
+            flip = dprcl['flip'])
+        outdct['froi'] = froi
+    #---------------------------------------------------------------------------
+
+
+    #---------------------------------------------------------------------------
     # run iterative Yang PVC
-    imgpvc, m_a = iyang(im, krnl, imgroi2, Cnt, itr=itr)
-    outdct = {'im':imgpvc, 'froi':froi2, 'imroi':imgroi2, 'faff':faff}
+    imgpvc, m_a = iyang(im, krnl, imgroi, Cnt, itr=itr)
+    #---------------------------------------------------------------------------
+
+    outdct['im'] = imgpvc
+    outdct['imroi'] = imgroi
+    outdct['faff'] = faff
+
     if store_img:
-        fpvc = os.path.join( os.path.split(fpet)[0],
-                             os.path.split(fpet)[1].split('.')[0]+'_PVC'+fcomment+'.nii.gz')
+        fpvc = os.path.join( pvc_dir,
+                             os.path.split(fpet)[1].split('.nii')[0]+'_PVC'+fcomment+'.nii.gz')
         imio.array2nii( imgpvc[::-1,::-1,:], B, fpvc, descrip='pvc=iY')
         outdct['fpet'] = fpvc
-    # ===============================================================
 
     return outdct
 
@@ -573,257 +735,298 @@ def ct2mu(im):
 
 
 
-# <><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
-# I M A G E   R E G I S T R A T I O N
-# <><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
-
-def imfill(immsk):
-    '''fill the empty patches of image mask 'immsk' '''
-
-    for iz in range(immsk.shape[0]):
-        for iy in range(immsk.shape[1]):
-            ix0 = np.argmax(immsk[iz,iy,:]>0)
-            ix1 = immsk.shape[2] - np.argmax(immsk[iz,iy,::-1]>0)
-            if (ix1-ix0) > immsk.shape[2]-10: continue
-            immsk[iz,iy,ix0:ix1] = 1
-    return immsk
-
-#-------------------------------------------------------------------------------------
-def affine_niftyreg(
-    fref,
-    fflo,
-    outpath='',
-    fname_aff='',
-    pickname='ref',
-    fcomment='',
-    executable = '',
-    omp=1,
-    rigOnly = False,
-    affDirect = False,
-    maxit=5,
-    speed=True,
-    pi=50, pv=50,
-    smof=0, smor=0,
-    rmsk=True,
-    fmsk=True,
-    rfwhm=15.,
-    rthrsh=0.05,
-    ffwhm = 15.,
-    fthrsh=0.05,
-    verbose=True):
-
-    # check if the executable exists:
-    if not os.path.isfile(executable):
-        raise IOError('Incorrect path to executable file for registration.')
-
-    #create a folder for images registered to ref
-    if outpath!='':
-        odir = os.path.join(outpath,'affine')
-        fimdir = os.path.join(outpath, os.path.join('affine','mask'))
-    else:
-        odir = os.path.join(os.path.dirname(fflo),'affine')
-        fimdir = os.path.join(os.path.dirname(fflo), 'affine', 'mask')
-    imio.create_dir(odir)
-    imio.create_dir(fimdir)
-
-    if rmsk:
-        f_rmsk = os.path.join(fimdir, 'rmask_'+os.path.basename(fref).split('.nii')[0]+'.nii.gz')
-        imdct = imio.getnii(fref, output='all')
-        smoim = ndi.filters.gaussian_filter(imdct['im'],
-                                            imio.fwhm2sig(rfwhm, voxsize=abs(imdct['hdr']['pixdim'][1])), mode='mirror')
-        thrsh = rthrsh*smoim.max()
-        immsk = np.int8(smoim>thrsh)
-        immsk = imfill(immsk)
-        imio.array2nii( immsk[::-1,::-1,:], imdct['affine'], f_rmsk)
-    if fmsk:
-        f_fmsk = os.path.join(fimdir, 'fmask_'+os.path.basename(fflo).split('.nii')[0]+'.nii.gz')
-        imdct = imio.getnii(fflo, output='all')
-        smoim = ndi.filters.gaussian_filter(
-                imdct['im'],
-                imio.fwhm2sig(ffwhm, voxsize=abs(imdct['hdr']['pixdim'][1])),
-                mode='mirror'
-        )
-        thrsh = fthrsh*np.ptp(smoim) + np.min(smoim)
-        immsk = np.int8(smoim>thrsh)
-        immsk = imfill(immsk)
-        imio.array2nii( immsk[::-1,::-1,:], imdct['affine'], f_fmsk)
-
-    # output in register with ref and text file for the affine transform
-    if fname_aff!='':
-        fout = os.path.join(odir, fname_aff.split('.')[0]+'.nii.gz')
-        faff = os.path.join(odir, fname_aff)
-    else:
-        if pickname=='ref':
-            fout = os.path.join(odir, 'affine_ref-' \
-                +os.path.basename(fref).split('.nii')[0]+fcomment+'.nii.gz')
-            faff = os.path.join(odir, 'affine_ref-' \
-                +os.path.basename(fref).split('.nii')[0]+fcomment+'.txt')
-        elif pickname=='flo':
-            fout = os.path.join(odir, 'affine_flo-' \
-                +os.path.basename(fflo).split('.nii')[0]+fcomment+'.nii.gz')
-            faff = os.path.join(odir, 'affine_flo-' \
-                +os.path.basename(fflo).split('.nii')[0]+fcomment+'.txt')
+#===============================================================================
+def centre_mass_img(imdct):
+    ''' Calculate the centre of mass of an image along each axes (x,y,z),
+        separately.
+        Arguments:
+        imdct - the image dictionary with the image and header data.
+        Output the list of the centre of mass for each axis.
+    '''
     
-    # call the registration routine
-    cmd = [executable,
-         '-ref', fref,
-         '-flo', fflo,
-         '-aff', faff,
-         '-pi', str(pi),
-         '-pv', str(pv),
-         '-smooF', str(smof),
-         '-smooR', str(smor),
-         '-maxit', '10',
-         '-omp', str(omp),
-         '-res', fout]
-    if speed:
-        cmd.append('-speeeeed')
-    if rigOnly:
-        cmd.append('-rigOnly')
-    if affDirect:
-        cmd.append('affDirect')
-    if rmsk: 
-        cmd.append('-rmask')
-        cmd.append(f_rmsk)
-    if fmsk:
-        cmd.append('-fmask')
-        cmd.append(f_fmsk)
-    if not verbose:
-        cmd.append('-voff')
+    #> initialise centre of mass array
+    com = np.zeros(3, dtype=np.float32)
+    #> total image sum
+    imsum = np.sum(imdct['im'])
 
-    call(cmd)
-       
-    return faff, fout
-#-------------------------------------------------------------------------------------
+    for ind_ax in [-1, -2, -3]:
+        #> list of axes
+        axs = range(imdct['im'].ndim)
+        del axs[ind_ax]
+        #> indexed centre of mass
+        icom = np.sum( np.sum(imdct['im'], axis=tuple(axs)) \
+                * np.arange(imdct['im'].shape[ind_ax]))/imsum
+        #> centre of mass in mm
+        com[abs(ind_ax)-1] = icom * imdct['hdr']['pixdim'][abs(ind_ax)]
 
-#-------------------------------------------------------------------------------------
-def resample_niftyreg(
-        fref,
-        fflo,
-        faff,
-        outpath = '',
+    return com
+#===============================================================================
+
+
+#===============================================================================
+def nii_modify(
+        nii,
         fimout = '',
+        outpath = '',
         fcomment = '',
-        pickname = 'ref',
-        intrp = 1,
+        voxel_range=[]):
+
+    ''' Modify the NIfTI image given either as a file path or a dictionary,
+        obtained by nimpa.getnii(file_path).
+    '''
+
+    if isinstance(nii, basestring) and os.path.isfile(nii):
+        dctnii = imio.getnii(nii, output='all')
+        fnii = nii
+    if isinstance(nii, dict) and 'im' in nii:
+        dctnii = nii
+        if 'fim' in dctnii:
+            fnii = dctnii['fim']
+
+    #---------------------------------------------------------------------------
+    #> output path
+    if outpath=='' and fimout!='' and '/' in fimout:
+        opth = os.path.dirname(fimout)
+        if opth=='' and isinstance(fnii, basestring) and os.path.isfile(fnii):
+            opth = os.path.dirname(nii)
+        fimout = os.path.basename(fimout)
+
+    elif outpath=='' and isinstance(fnii, basestring) and os.path.isfile(fnii):
+        opth = os.path.dirname(fnii)
+    else:
+        opth = outpath
+    imio.create_dir(opth)
+
+    #> output floating and affine file names
+    if fimout=='':
+
+        if fcomment=='':
+            fcomment += '_nimpa-modified'
+
+        fout = os.path.join(
+                opth,
+                os.path.basename(fnii).split('.nii')[0]+fcomment+'.nii.gz')
+    else:
+        fout = os.path.join(
+                opth,
+                fimout.split('.nii')[0]+'.nii.gz')
+    #---------------------------------------------------------------------------
+
+
+    #> reduce the max value to 255
+    if voxel_range and len(voxel_range)==1:
+        im = voxel_range[0] * dctnii['im']/np.max(dctnii['im'])
+    elif voxel_range and len(voxel_range)==2:
+        #> normalise into range 0-1
+        im = (dctnii['im'] - np.min(dctnii['im'])) / np.ptp(dctnii['im'])
+        #> convert to voxel_range 
+        im = voxel_range[0] + im*(voxel_range[1] - voxel_range[0])
+    else:
+        return None
+
+    #> output file name for the extra reference image
+    imio.array2nii(
+        im,
+        dctnii['affine'],
+        fout,
+        trnsp = (dctnii['transpose'].index(0),
+                 dctnii['transpose'].index(1),
+                 dctnii['transpose'].index(2)),
+        flip = dctnii['flip'])
+
+    return {'fim':fout, 'im':im, 'affine':dctnii['affine']}
+
+
+
+
+
+#===============================================================================
+
+
+
+
+
+#  ____________________________________________________________________________
+# |                                                                            |
+# |                 M R   B I A S   C O R R E C T I O N                        |
+# |____________________________________________________________________________|
+
+def bias_field_correction(
+        fmr,
+        fimout = '',
+        outpath = '',
+        fcomment = '_N4bias',
         executable = '',
-        verbose = True):
+        exe_options = [],
+        sitk_image_mask = True,
+        verbose = False,):
 
-    # check if the executable exists:
-    if not os.path.isfile(executable):
-        raise IOError('Incorrect path to executable file for registration.')
+    ''' Correct for bias field in MR image(s) given in <fmr> as a string
+        (single file) or as a list of strings (multiple files).  
 
+        Output dictionary with the bias corrected file names.
+
+        Options:
+        - fimout:       The name (with path) of the output file.  It's 
+                        ignored when multiple files are given as input.  If
+                        given for a single file name, the <outpath> and
+                        <fcomment> options are ignored.
+        - outpath:      Path to the output folder
+        - fcomment:     A prefix comment to the file name
+        - executable:   The path to the executable, overrides the above
+                        choice of software;  if 'sitk' is given instead
+                        of the path, the Python module SimpleITK will be 
+                        used if it is available.
+        - exe_options:  Options for the executable in the form of a list of
+                        strings.
+        - sitk_image_mask:  Image masking will be used if SimpleITK is
+                            chosen.
+    '''
+
+    if executable=='sitk' and not 'SimpleITK' in sys.modules:
+        print  'e> if SimpleITK module is required for bias correction' \
+                +' it needs to be first installed.\n' \
+                +'   Install the module by:\n' \
+                +'   conda install -c https://conda.anaconda.org/simpleitk SimpleITK=1.2.0\n' \
+                +'   or pip install SimpleITK'
+        return None
+
+    #---------------------------------------------------------------------------
+    # INPUT
+    #---------------------------------------------------------------------------
+    #> path to a single file 
+    if isinstance(fmr, basestring) and os.path.isfile(fmr):
+        fins = [fmr]
+
+    #> list of file paths
+    elif isinstance(fmr, list) and all([os.path.isfile(f) for f in fmr]):
+        fins = fmr
+        print 'i> multiple input files => ignoring the single output file name.'
+        fimout = ''
+
+    #> path to a folder
+    elif isinstance(fmr, basestring) and os.path.isdir(fmr):
+        fins = [os.path.join(fmr, f) for f in os.listdir(fmr) if f.endswith(('.nii', '.nii.gz'))]
+        print 'i> multiple input files from input folder.'
+        fimout = ''
+
+    else:
+        raise ValueError('could not decode the input of floating images.')
+    #---------------------------------------------------------------------------
+
+
+
+
+    #---------------------------------------------------------------------------
+    # OUTPUT
+    #---------------------------------------------------------------------------
     #> output path
     if outpath=='' and fimout!='':
         opth = os.path.dirname(fimout)
         if opth=='':
-            opth = os.path.dirname(fflo)
+            opth = os.path.dirname(fmr)
+            fimout = os.path.join(opth, fimout)
+        n4opth = opth
+        fcomment = ''
 
     elif outpath=='':
-        opth = os.path.dirname(fflo)
+        opth = os.path.dirname(fmr)
+        #> N4 bias correction specific folder
+        n4opth = os.path.join(opth, 'N4bias')
 
     else:
         opth = outpath
+        #> N4 bias correction specific folder
+        n4opth = os.path.join(opth, 'N4bias')
 
-    imio.create_dir(opth)
+    imio.create_dir(n4opth)
 
-    #> the output naming
-    if '/' in fimout:
-        fout = fimout
-    elif fimout!='' and not os.path.isfile(fimout):
-        fout = os.path.join(opth, fimout)
-    elif pickname=='ref':
-        fout = os.path.join(opth, 'affine_ref-' \
-                + os.path.basename(fref).split('.nii')[0]+fcomment+'.nii.gz')
-    elif pickname=='flo':        
-        fout = os.path.join(opth, 'affine_flo-' \
-                + os.path.basename(fflo).split('.nii')[0]+fcomment+'.nii.gz')
-
-    if isinstance(intrp, (int, long)): intrp = str(intrp)
-    
-    cmd = [executable,
-       '-ref', fref,
-       '-flo', fflo,
-       '-trans', faff,
-       '-res', fout,
-       '-inter', intrp
-       ]
-    if not verbose:
-        cmd.append('-voff')
-    call(cmd)
-
-    return fout
-#-------------------------------------------------------------------------------------
+    outdct = {}
+    #---------------------------------------------------------------------------
 
 
 
-#-------------------------------------------------------------------------------------
-def reg_mr2pet(
-        fpet,
-        mri,
-        Cnt,
-        rigOnly = True,
-        affDirect = False,
-        maxit=5,
-        outpath='',
-        fcomment=''
-    ):
-    ''' MR to PET registration with optimal choice of registration parameters
-    '''
+    for fin in fins:
 
-    if isinstance(mri, dict):
-        # check if NIfTI file is given
-        if 'T1N4' in mri and os.path.isfile(mri['T1N4']):
-            ft1w = mri['T1N4']
-        # or another bias corrected
-        elif 'T1bc' in mri and os.path.isfile(mri['T1bc']):
-            ft1w = mri['T1bc']
-        elif 'T1nii' in mri and os.path.isfile(mri['T1nii']):
-            ft1w = mri['T1nii']
-        elif 'T1DCM' in mri and os.path.exists(mri['MRT1W']):
-            # create file name for the converted NIfTI image
-            fnii = 'converted'
-            call( [ Cnt['DCM2NIIX'], '-f', fnii, mri['T1nii'] ] )
-            ft1nii = glob.glob( os.path.join(mri['T1nii'], '*converted*.nii*') )
-            ft1w = ft1nii[0]
-        else:
-            print 'e> disaster: could not fine a T1w image!'
-            raise IOError('No correct path given to T1w image in the specified dictionary')
+        if verbose:
+            print 'i> input for bias correction:\n', fin
+        
+        if fimout=='':
+            # split path
+            fspl = os.path.split(fin)
             
-    elif isinstance(mri, basestring):
-        if os.path.isfile(mri):
-            ft1w = mri
+            # N4 bias correction file output paths
+            fn4 = os.path.join( n4opth, fspl[1].split('.nii')[0]\
+                                + fcomment +'.nii.gz')
         else:
-            raise IOError('No correct path given to T1w image in the specified string')
+            fn4 = fimout
 
-    else:
-        raise IOError('No correct input specified to T1w image')
+        if not os.path.exists(fn4):
 
-    if not os.path.isfile(fpet):
-        raise IOError('No correct input specified for the PET image')
+            if executable=='sitk':
+                #==============================================
+                # SimpleITK Bias field correction for T1 and T2
+                #==============================================
+                #> initialise the corrector
+                corrector = sitk.N4BiasFieldCorrectionImageFilter()
+                # numberFilltingLevels = 4
 
-    # run the registration and return the results (file paths to affine trans. and the resampled image)
-    return affine_niftyreg(
-        fpet, ft1w,
-        executable = Cnt['REGPATH'],
-        outpath=outpath,
-        fcomment=fcomment,
-        omp=multiprocessing.cpu_count()/2,
-        rigOnly = rigOnly,
-        affDirect = affDirect,
-        maxit=maxit,
-        speed=True,
-        pi=50, pv=50,
-        smof=0., smor=0.,
-        rmsk=True,
-        fmsk=True,
-        rfwhm=15.,
-        rthrsh=0.05,
-        ffwhm = 15.,
-        fthrsh=0.05,
-        verbose=Cnt['VERBOSE'])
-#-------------------------------------------------------------------------------------
+                # read input file        
+                im = sitk.ReadImage(fin)
 
+                #> create a object specific mask
+                fmsk = os.path.join( n4opth, fspl[1].split('.nii')[0] +'_sitk_mask.nii.gz')
+                msk = sitk.OtsuThreshold(im, 0, 1, 200)
+                sitk.WriteImage(msk, fmsk)
+                
+                #> cast to 32-bit float
+                im = sitk.Cast( im, sitk.sitkFloat32 )
+
+                #-------------------------------------------
+                print 'i> correcting bias field for', fin 
+                n4out = corrector.Execute(im, msk)
+                sitk.WriteImage(n4out, fn4)
+                #-------------------------------------------
+
+                if sitk_image_mask:
+                    if not 'fmsk' in outdct: outdct['fmsk'] = []
+                    outdct['fmsk'].append(fmsk)
+
+
+            elif os.path.basename(executable)=='N4BiasFieldCorrection' \
+                    and os.path.isfile(executable):
+                
+                cmd = [executable,  '-i', fin, '-o', fn4]
+            
+                if verbose and os.path.basename(executable)=='N4BiasFieldCorrection':
+                    cmd.extend(['-v', '1'])
+
+                cmd.extend(exe_options)
+                
+                call(cmd)
+
+                if 'command' not in outdct:
+                    outdct['command'] = []
+                outdct['command'].append(cmd)
+
+            elif os.path.isfile(executable):
+
+                cmd = [executable]
+                cmd.extend(exe_options)
+                call(cmd)
+
+                if 'command' not in outdct:
+                    outdct['command'] = cmd
+        
+        else:
+            print '   N4 bias corrected file seems already existing.'
+
+        #> output to dictionary 
+        if not 'fim' in outdct: outdct['fim'] = []
+        outdct['fim'].append(fn4)
+
+
+    return outdct
 
 
 #-------------------------------------------------------------------------------------
@@ -931,7 +1134,7 @@ def mr2pet_rigid(
                                             imio.fwhm2sig(rfwhm, voxsize=abs(imdct['affine'][0,0])), mode='mirror')
         thrsh = rthrsh*smoim.max()
         immsk = np.int8(smoim>thrsh)
-        immsk = imfill(immsk)
+        immsk = regseg.imfill(immsk)
         imio.array2nii( immsk[::-1,::-1,:], imdct['affine'], f_rmsk)
     if fmsk:
         f_fmsk = os.path.join(fimdir, 'fmask.nii.gz')
@@ -940,7 +1143,7 @@ def mr2pet_rigid(
                                             imio.fwhm2sig(ffwhm, voxsize=abs(imdct['affine'][0,0])), mode='mirror')
         thrsh = fthrsh*smoim.max()
         immsk = np.int8(smoim>thrsh)
-        immsk = imfill(immsk)
+        immsk = regseg.imfill(immsk)
         imio.array2nii( immsk[::-1,::-1,:], imdct['affine'], f_fmsk)
 
     # if provided, separate the comment with underscore
@@ -975,394 +1178,6 @@ def mr2pet_rigid(
         sys.exit()
         
     return faff
-
-
-#---- SPM ----
-def resample_spm(
-        imref,
-        imflo,
-        M,
-        matlab_eng='',
-        intrp=1.,
-        which=1,
-        mask=0,
-        mean=0,
-        outpath='',
-        fimout='',
-        fcomment='',
-        prefix='r_',
-        pickname='ref',
-        del_ref_uncmpr=False,
-        del_flo_uncmpr=False,
-        del_out_uncmpr=False
-    ):
-
-    import matlab
-    from pkg_resources import resource_filename
-
-    #-start Matlab engine if not given
-    if matlab_eng=='':
-        eng = matlab.engine.start_matlab()
-    else:
-        eng = matlab_eng
-
-    # add path to SPM matlab file
-    spmpth = resource_filename(__name__, 'spm')
-    eng.addpath(spmpth, nargout=0)
-
-    #> output path
-    if outpath=='' and fimout!='':
-        opth = os.path.dirname(fimout)
-        if opth=='':
-            opth = os.path.dirname(imflo)
-
-    elif outpath=='':
-        opth = os.path.dirname(imflo)
-
-    else:
-        opth = outpath
-
-    imio.create_dir(opth)
-
-    #> decompress if necessary 
-    if imref[-3:]=='.gz':
-        imrefu = imio.nii_ugzip(imref, outpath=opth)
-    else:
-        fnm = os.path.basename(imref).split('.nii')[0] + '_copy.nii'
-        imrefu = os.path.join(opth, fnm)
-        shutil.copyfile(imref, imrefu)
-
-    #> floating
-    if imflo[-3:]=='.gz': 
-        imflou = imio.nii_ugzip(imflo, outpath=opth)
-    else:
-        fnm = os.path.basename(imflo).split('.nii')[0] + '_copy.nii'
-        imflou = os.path.join(opth, fnm)
-        shutil.copyfile(imflo, imflou)
-
-    if isinstance(M, basestring):
-        M = np.load(M)
-        print 'i> matrix M given in the form of numpy file'
-    elif isinstance(M, (np.ndarray, np.generic)):
-        print 'i> matrix M given in the form of Numpy array'
-    else:
-        raise IOError('The form of affine matrix not recognised.')
-
-    # run the Matlab SPM resampling
-    r = eng.resample_spm_m(
-        imrefu,
-        imflou,
-        matlab.double(M.tolist()),
-        mask,
-        mean,
-        intrp,
-        which,
-        prefix)
-
-    
-    #-compress the output
-    split = os.path.split(imflou)
-    fim = os.path.join(split[0], prefix+split[1])
-    imio.nii_gzip(fim, outpath=opth)
-
-    # delete the uncompressed
-    if del_ref_uncmpr:  os.remove(imrefu)
-    if del_flo_uncmpr and os.path.isfile(imflou):  os.remove(imflou)
-    if del_out_uncmpr: os.remove(fim)
-
-    #> the compressed output naming
-    if fimout!='':
-        fout = os.path.join(opth, fimout)
-    elif pickname=='ref':
-        fout = os.path.join(opth, 'affine_ref-' \
-                + os.path.basename(imrefu).split('.nii')[0]+fcomment+'.nii.gz')
-    elif pickname=='flo':        
-        fout = os.path.join(opth, 'affine_flo-' \
-                + os.path.basename(imflo).split('.nii')[0]+fcomment+'.nii.gz')
-    # change the file name
-    os.rename(fim+'.gz', fout)
-
-    return fout
-
-
-def coreg_spm(
-        imref,
-        imflo,
-        matlab_eng='',
-        outpath='',
-        fname_aff='',
-        costfun='nmi',
-        sep = [4,2],
-        tol = [ 0.0200,0.0200,0.0200,0.0010,0.0010,0.0010,
-                0.0100,0.0100,0.0100,0.0010,0.0010,0.0010],
-        fwhm = [7,7],
-        params = [0,0,0,0,0,0],
-        graphics = 1,
-        visual = 0,
-        del_uncmpr=True,
-        save_mat=True
-    ):
-
-    import matlab
-    from pkg_resources import resource_filename
-
-    #-start Matlab engine if not given
-    if matlab_eng=='':
-        eng = matlab.engine.start_matlab()
-    else:
-        eng = matlab_eng
-
-    # add path to SPM matlab file
-    spmpth = resource_filename(__name__, 'spm')
-    print 'PATH: ' + spmpth
-    eng.addpath(spmpth, nargout=0)
-
-    #> output path
-    if outpath=='' and fname_aff!='' and '/' in fname_aff:
-        opth = os.path.dirname(fname_aff)
-        if opth=='':
-            opth = os.path.dirname(imflo)
-        fname_aff = os.path.basename(fname_aff)
-    elif outpath=='':
-        opth = os.path.dirname(imflo)
-    else:
-        opth = outpath
-    imio.create_dir(opth)
-
-    #> decompress ref image as necessary 
-    if imref[-3:]=='.gz':
-        imrefu = imio.nii_ugzip(imref, outpath=opth)
-    else:
-        fnm = os.path.basename(imref).split('.nii')[0] + '_copy.nii'
-        imrefu = os.path.join(opth, fnm)
-        shutil.copyfile(imref, imrefu)
-    
-    #> floating
-    if imflo[-3:]=='.gz': 
-        imflou = imio.nii_ugzip(imflo, outpath=opth)
-    else:
-        fnm = os.path.basename(imflo).split('.nii')[0] + '_copy.nii'
-        imflou = os.path.join(opth, fnm)
-        shutil.copyfile(imflo, imflou)
-
-    # run the matlab SPM coregistration
-    Mm = eng.coreg_spm_m(
-        imrefu,
-        imflou,
-        costfun,
-        matlab.double(sep),
-        matlab.double(tol),
-        matlab.double(fwhm),
-        matlab.double(params),
-        graphics,
-        visual
-    )
-    # get the affine matrix
-    M = np.array(Mm._data.tolist())
-    M = M.reshape(4,4).T
-
-    # delete the uncompressed files
-    if del_uncmpr:
-        if imref[-3:]=='.gz': os.remove(imrefu)
-        if imflo[-3:]=='.gz': os.remove(imflou)
-
-    imio.create_dir( os.path.join(opth, 'affine-spm') )
-    if fname_aff == '':
-        faff = os.path.join(
-                opth,
-                'affine-spm',
-                'affine-spm-'+os.path.basename(imref).split('.nii')[0]+'.npy')
-    else:
-        faff = os.path.join(
-                opth,
-                'affine-spm',
-                fname_aff + '.npy')
-
-    #> safe the affine transformation
-    np.save(faff, M)
-
-    return {'mat':M, 'faff':faff}
-
-
-
-#---- FSL ----
-def affine_fsl(
-        imref,
-        imflo,
-        outpath='',
-        fname_aff='',
-        fcomment='',
-        executable='fsl5.0-flirt',
-        costfun='normmi',
-        dof=6,
-        hstbins=256,
-        verbose=True):
-
-
-
-    #> output path
-    if outpath=='' and fname_aff!='' and os.path.isfile(fname_aff):
-        opth = os.path.dirname(fname_aff)
-        faff = fname_aff
-    else:
-
-        if outpath!='':
-            opth = outpath
-        else:
-            opth = os.path.dirname(imflo)
-
-        if fname_aff!='':
-            faff = os.path.join(opth, 'affine-fsl', fname_aff)
-        else:
-            faff = os.path.join(opth, 'affine-fsl',
-                    os.path.basename(imref).split('.nii')[0]+fcomment+'.mat')
-
-    imio.create_dir(os.path.join(opth, 'affine-fsl'))
-    
-    #> command with options for FSL-FLIRT registration
-    cmd = [ executable,
-            '-cost', costfun,
-            '-dof', str(dof),
-            '-omat', faff,
-            '-in', imflo,
-            '-ref', imref,
-            '-bins', str(hstbins)]
-
-    #> add verbose mode if requested
-    if isinstance(verbose, bool): verbose = int(verbose)
-    if verbose>0: cmd.extend(['-verbose', str(verbose)])
-
-    #> execute FSL-FLIRT command with the above options
-    call(cmd)
-
-    # convert to Numpy float
-    aff = np.loadtxt(faff)
-    # np.savetxt(faff.split('.')[0]+'_np-float.txt', aff)
-
-    return aff, faff
-
-
-def resample_fsl(
-        imref,
-        imflo,
-        faff,
-        outpath = '',
-        fimout = '',
-        pickname = 'ref',
-        fcomment = '',
-        intrp = 1,
-        executable = 'fsl5.0-flirt'):
-
-    print '==================================================================='
-    print ' F S L  resampling'
-
-    #> output path
-    if outpath=='' and fimout!='':
-        opth = os.path.dirname(fimout)
-        if opth=='':
-            opth = os.path.dirname(imflo)
-
-    elif outpath=='':
-        opth = os.path.dirname(imflo)
-    elif outpath!='':
-        opth = outpath
-    
-    imio.create_dir(opth)
-
-    #> the output naming
-    if '/' in fimout:
-        fout = fimout
-    elif fimout!='' and not os.path.isfile(fimout):
-        fout = os.path.join(opth, fimout)
-    elif pickname=='ref':
-        fout = os.path.join(opth, 'affine_ref-' \
-                + os.path.basename(imref).split('.nii')[0]+fcomment+'.nii.gz')
-    elif pickname=='flo':        
-        fout = os.path.join(opth, 'affine_flo-' \
-                + os.path.basename(imflo).split('.nii')[0]+fcomment+'.nii.gz')
-
-    if isinstance(intrp, (int, long)): intrp = str(intrp)
-    if intrp=='1':
-        interpolation = 'trilinear'
-    elif intrp=='0':
-        interpolation = 'nearestneighbour'
-
-    cmd = [ executable,
-            '-in', imflo,
-            '-ref', imref,
-            '-out', fout,
-            '-init', faff,
-            '-applyxfm',
-            '-interp', interpolation]
-    call(cmd)
-
-    print 'D O N E'
-    print '==================================================================='
-
-    return fout
-
-#=======================================================================
-# V I N I C I   R E G I S T R A T I O N
-#=======================================================================
-
-def coreg_vinci(imref, imflo, xmlparams='', xmlout=''):
-    ''' Find rigid transformation between PET and MR using Vinci's MMM.
-        Based on the RunMMMJob.py file provided by Vinci in
-        .../vinci4/external/python.
-        Arguments:
-        xmlparams   parameters for registration job
-        xmlout      the registration output and summary in XML format.
-
-    '''
-
-    #> get the NiftyPET folder
-    tmp = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    niftypet_dir = os.path.dirname(os.path.dirname(tmp))
-
-    #> add the Vinci to the Python path
-    sys.path.append(os.path.join(niftypet_dir, 'ext_vinci'))
-
-    import VinciPy as vp
-
-    vbin = vp.Vinci_Bin.Vinci_Bin()
-    con = vp.Vinci_Connect.Vinci_Connect(vbin)
-    szVinciBinPath = con.StartMyVinci()
-
-    vc = vp.Vinci_Core.Vinci_CoreCalc(con)
-    vc.StdProject()
-
-    #> open the xml registration parameters file
-    f = open(xmlparams, 'rb')
-    mmm_params = f.read()
-    f.close()
-
-    #> check scheme data file and remove possible XML comments at its beginning
-    root = vp.Vinci_XML.ElementTree.fromstring(mmm_params)
-    if root.tag != "MMM":
-        sys.exit("scheme data file %s does not contain tag MMM\n"%szMMMTemplateFile)
-
-    szSchemeFile = vp.Vinci_XML.ElementTree.tostring(root)
-    #> bytes -> str
-    szSchemeFile = szSchemeFile.decode("utf-8")
-
-    ref = vp.Vinci_ImageT.newTemporary(vc, szFileName = imref)
-    ref.setColorSettings(CTable="Rainbow4")
-
-    rsl = vp.Vinci_ImageT.newTemporary(vc, szFileName = imflo)
-    rsl.alignToRef(ref, szSchemeFile, szRegistrationSummaryFile = xmlout)
-
-    #> close everything
-    rsl.killYourself()  #close image buffer
-    ref.killYourself()
-    con.CloseVinci(True)
-
-
-
-
-
-
-
-
 
 
 

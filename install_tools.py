@@ -21,21 +21,37 @@ if 'DISPLAY' in os.environ:
     from Tkinter import Tk
     from tkFileDialog import askdirectory
 
-# NiftyReg git repository
-repo_reg = 'https://cmiclab.cs.ucl.ac.uk/mmodat/niftyreg.git' #'git://git.code.sf.net/p/niftyreg/git'
-# git SHA-1 checksum for NiftyReg version (16 Nov 2017) used for PET/MR image registration and resampling
-sha1_reg = 'f673b7837c0824f55dedb1534b32b55bf68a2823'
+# -----------------------------------
+#> NiftyReg git repository
+repo_reg = 'https://github.com/KCL-BMEIS/niftyreg.git'
+# repo_reg = 'https://cmiclab.cs.ucl.ac.uk/mmodat/niftyreg.git' #'git://git.code.sf.net/p/niftyreg/git'
+
+#> git SHA-1 checksum for NiftyReg version used for PET/MR image registration and resampling
+sha1_reg = '731a565bd42ca97ff5968adb1c06133ea72f0856'
+# 'f673b7837c0824f55dedb1534b32b55bf68a2823'
 #'6bf84b492050a4b9a93431209babeab9bc8f14da' 
 #'62af1ca6777379316669b6934889c19863eaa708'
-reg_ver = '1.5.58'
 
+reg_ver = '1.5.61'
+# -----------------------------------
+
+# -----------------------------------
 # dcm2niix git repository
 repo_dcm = 'https://github.com/rordenlab/dcm2niix'
-http_dcm_lin =  'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20180622/dcm2niix_27-Jun-2018_lnx.zip'
-http_dcm_win = 'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20180622/dcm2niix_27-Jun-2018_win.zip'
+http_dcm_lin = 'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20181125/dcm2niix_25-Nov-2018_lnx.zip'
+http_dcm_win = 'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20181125/dcm2niix_25-Nov-2018_win.zip'
+http_dcm_mac = 'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20181125/dcm2niix_25-Nov-2018_mac.zip'
+
 # git SHA-1 checksum for the version used for PET/MR
-sha1_dcm = '4b641113273d86ad73123816993092fc643ac62f'
-dcm_ver = '1.0.20180622'
+sha1_dcm = '32160d74cd266a59e81a75b655c16de27b8c7681'  
+dcm_ver = '1.0.20181125'
+# -----------------------------------
+
+# PREVIOUS WORKING:
+# http_dcm_lin =  'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20180622/dcm2niix_27-Jun-2018_lnx.zip'
+# http_dcm_win = 'https://github.com/rordenlab/dcm2niix/releases/download/v1.0.20180622/dcm2niix_27-Jun-2018_win.zip'
+# sha1_dcm =  '4b641113273d86ad73123816993092fc643ac62f'
+# dcm_ver = '1.0.20180622'
 
 # source and build folder names
 dirsrc = '_src'
@@ -51,6 +67,7 @@ def query_yesno(question):
     while True:
         sys.stdout.write(question + prompt)
         choice = raw_input().lower()
+
         if choice == '':
             return True
         elif choice in valid:
@@ -63,7 +80,9 @@ def input_path(question, default=os.path.expanduser('~')):
     while True:
         question += '['+default+']:'
         path = raw_input(question)
-        if os.path.isdir(path):
+        if path == '':
+            return default
+        elif os.path.isdir(path):
             return path
         else:
             print 'e> the provided path is not valid: '+str(path)
@@ -92,7 +111,7 @@ def check_depends():
     try:
         out = call(['cmake', '--version'])
     except OSError:
-        print 'e> git does not seem to be installed;  for help, visit: https://git-scm.com/download/'
+        print 'e> cmake does not seem to be installed;  for help, visit: https://cmake.org/download/'
         outdct['cmake'] = False
 
     return outdct
@@ -133,7 +152,8 @@ def check_version(Cnt, chcklst=['RESPATH','REGPATH','DCM2NIIX','HMUDIR']):
         try:
             proc = Popen([Cnt['DCM2NIIX'], '-h'], stdout=PIPE)
             out = proc.stdout.read()
-            if dcm_ver in re.search('(?<=dcm2niiX version v)\d{1,2}.\d{1,2}.\d*', out).group(0):
+            ver_str = re.search('(?<=dcm2niiX version v)\d{1,2}.\d{1,2}.\d*', out)
+            if ver_str and dcm_ver in ver_str.group(0):
                 output['DCM2NIIX'] = True
         except OSError:
             print 'e> dcm2niix either is NOT installed or is corrupt.'
@@ -173,6 +193,11 @@ def download_dcm2niix(Cnt, path):
             http_dcm_lin,
             os.path.join(path, 'dcm2niix.zip')
         )
+    elif platform.system()=='Darwin':
+        urllib.urlretrieve(
+            http_dcm_mac,
+            os.path.join(path, 'dcm2niix.zip')
+        )
     else:
         raise OSError('Unrecognised operating system.')
 
@@ -195,23 +220,34 @@ def install_tool(app, Cnt):
     # get the current working directory
     cwd = os.getcwd()
 
-    # pick the target installation folder
+    # pick the target installation folder for tools
     if 'PATHTOOLS' in Cnt and Cnt['PATHTOOLS']!='':
         path_tools = Cnt['PATHTOOLS']
-    elif ('PATHTOOLS' not in Cnt or Cnt['PATHTOOLS']!='') and 'DISPLAY' in os.environ:
-        print '>>>>> DISPLAY', os.environ['DISPLAY']
-        Tk().withdraw()
-        dircore = askdirectory(title='choose a place for NiftyPET tools', initialdir=os.path.expanduser('~'))
-        # get the full (combined path)
-        path_tools = os.path.join(dircore, Cnt['DIRTOOLS'])
+    elif ('PATHTOOLS' not in Cnt or Cnt['PATHTOOLS']!=''):
+        if 'DISPLAY' in os.environ and platform.system() in ['Linux', 'Windows']:
+            print '>>>>> DISPLAY', os.environ['DISPLAY']
+            Tk().withdraw()
+            dircore = askdirectory(title='choose a place for NiftyPET tools', initialdir=os.path.expanduser('~'))
+            Tk().destroy()
+            # get the full (combined path)
+            path_tools = os.path.join(dircore, Cnt['DIRTOOLS'])
+        else:
+            try:
+                path_tools = input_path('Enter path for NiftyPET tools (registration, etc):')
+            except:
+                print 'enter the intended PATHTOOLS in resources.py located in ~/.niftypet/'
+                raise ValueError('\n e> could not get the path for NiftyPET_tools \n')
         Cnt['PATHTOOLS'] = path_tools
+
     else:
         if platform.system() == 'Linux' :
             path_tools = os.path.join( os.path.expanduser('~'), Cnt['DIRTOOLS'] )
         elif platform.system() == 'Windows' :
             path_tools = os.path.join( os.getenv('LOCALAPPDATA'), Cnt['DIRTOOLS'] )
         else:
+            print '\n=========================================================='
             print 'e> only Linux and Windows operating systems are supported!'
+            print '==========================================================\n'
             raise SystemError('OS not supported!')      
         Cnt['PATHTOOLS'] = path_tools
 
@@ -227,9 +263,11 @@ def install_tool(app, Cnt):
         repo = repo_dcm
         sha1 = sha1_dcm
         path = os.path.join(path_tools, 'dcm2niix')
-        # avoid installing from source, instead download the full version:
-        Cnt = download_dcm2niix(Cnt, path)
-        return Cnt
+
+        if not Cnt['CMPL_DCM2NIIX']:
+            # avoid installing from source, instead download the full version:
+            Cnt = download_dcm2niix(Cnt, path)
+            return Cnt
 
     # Check if the source folder exists and delete it, if it does
     if os.path.isdir(path): shutil.rmtree(path)
@@ -258,7 +296,7 @@ def install_tool(app, Cnt):
             '-G', Cnt['MSVC_VRSN']]
         call(cmd)
         call(['cmake', '--build', './', '--config', 'Release', '--target', 'install'])
-    elif platform.system()=='Linux':
+    elif platform.system() in ['Linux', 'Darwin']:
         cmd = ['cmake', '../'+dirsrc,
             '-DBUILD_ALL_DEP=ON',
             '-DCMAKE_INSTALL_PREFIX='+path]

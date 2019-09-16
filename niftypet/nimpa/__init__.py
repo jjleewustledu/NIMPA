@@ -15,12 +15,12 @@ if 'CONDA_DEFAULT_ENV' in os.environ:
 else:
 	env = ''
 # create the path for the resources files according to the OS platform
-if platform.system() == 'Linux' :
+if platform.system() in ['Linux', 'Darwin']:
 	path_resources = os.path.join( os.path.join(os.path.expanduser('~'),   '.niftypet'), env )
 elif platform.system() == 'Windows' :
 	path_resources = os.path.join( os.path.join(os.getenv('LOCALAPPDATA'), '.niftypet'), env )
 else:
-	print 'e> unrecognised operating system!  Linux and Windows operating systems only are supported.'
+	print 'e> unrecognised operating system!'
 	
 sys.path.append(path_resources)
 try:
@@ -31,12 +31,28 @@ except ImportError as ie:
     print '----------------------------'
 #===========================
 
-from dinf import gpuinfo, dev_info
+if resources.CC_ARCH != '' and platform.system() in ['Linux', 'Windows']:
+	from dinf import gpuinfo, dev_info
+	
 from prc import trimim, iyang, pvc_iyang, psf_general, psf_measured
-from prc import coreg_spm, resample_spm, affine_fsl, resample_fsl, coreg_vinci
-from prc import affine_niftyreg, resample_niftyreg, reg_mr2pet, imfill, pet2pet_rigid
+
+from prc import realign_mltp_spm, resample_mltp_spm
+from prc import coreg_spm, coreg_vinci, resample_spm, resample_vinci
+from prc import affine_fsl, resample_fsl
+from prc import affine_niftyreg, resample_niftyreg, pet2pet_rigid
 from prc import create_dir, time_stamp, fwhm2sig, getnii, getnii_descr, array2nii, dcm2im
 from prc import orientnii, nii_ugzip, nii_gzip, niisort, dcmsort, dcminfo, dcmanonym
+
 from prc import dice_coeff, dice_coeff_multiclass
+from prc import imfill, create_mask
+from prc import bias_field_correction
+from prc import pick_t1w
+
+from prc import motion_reg
 
 from prc import ct2mu
+from prc import nii_modify
+
+from prc import dcm2nii
+
+from img import create_disk, profile_points

@@ -13,6 +13,12 @@ import numpy as np
 import datetime
 import re
 import shutil
+import glob
+
+from subprocess import call
+
+#> NiftyPET resources
+import resources as rs
 
 # possible extentions for DICOM files
 dcmext = ('dcm', 'DCM', 'ima', 'IMA')
@@ -33,7 +39,7 @@ def time_stamp(simple_ascii=False):
     return nowstr
 
 #---------------------------------------------------------------
-def fwhm2sig (fwhm, voxsize=2.0):
+def fwhm2sig(fwhm, voxsize=2.0):
     return (fwhm/voxsize) / (2*(2*np.log(2))**.5)
 
 
@@ -54,22 +60,45 @@ def getnii(fim, nan_replace=None, output='image'):
     import numbers
 
     nim = nib.load(fim)
+
+    dim = nim.header.get('dim')
+    dimno = dim[0]
+
     if output=='image' or output=='all':
         imr = nim.get_data()
         # replace NaNs if requested
-        if isinstance(nan_replace, numbers.Number): imr[np.isnan(imr)]=nan_replace
-        # Flip y-axis and z-axis and then transpose.  Depends if dynamic (4 dimensions) or static (3 dimensions)
-        if len(nim.shape)==4:
-            imr  = np.transpose(imr[:,::-1,::-1,:], (3, 2, 1, 0))
-        elif len(nim.shape)==3:
-            imr  = np.transpose(imr[:,::-1,::-1], (2, 1, 0))
+        if isinstance(nan_replace, numbers.Number): imr[np.isnan(imr)]
+
+        imr = np.squeeze(imr)
+        if dimno!=imr.ndim and dimno==4:
+            dimno = imr.ndim
+        
+        #> get orientations from the affine
+        ornt = nib.orientations.axcodes2ornt(nib.aff2axcodes(nim.affine))
+        trnsp = tuple(np.int8(ornt[::-1,0]))
+        flip  = tuple(np.int8(ornt[:,1]))
+
+        #> flip y-axis and z-axis and then transpose.  Depends if dynamic (4 dimensions) or static (3 dimensions)
+        if dimno==4:
+            imr = np.transpose(imr[::-flip[0],::-flip[1],::-flip[2],:], (3,)+trnsp)
+        elif  dimno==3:
+            imr = np.transpose(imr[::-flip[0],::-flip[1],::-flip[2]], trnsp)
+    
     if output=='affine' or output=='all':
-        A = nim.get_sform()
-        if not A[:3,:3].any():
-            A = nim.get_qform()
+        # A = nim.get_sform()
+        # if not A[:3,:3].any():
+        #     A = nim.get_qform()
+        A = nim.affine
 
     if output=='all':
-        out = {'im':imr, 'affine':A, 'dtype':nim.get_data_dtype(), 'shape':imr.shape, 'hdr':nim.header}
+        out = { 'im':imr,
+                'affine':A,
+                'fim':fim,
+                'dtype':nim.get_data_dtype(),
+                'shape':imr.shape,
+                'hdr':nim.header,
+                'transpose':trnsp,
+                'flip':flip}
     elif output=='image':
         out = imr
     elif output=='affine':
@@ -97,22 +126,57 @@ def getnii_descr(fim):
         rcndic[tmp[0]] = tmp[1]
     return rcndic
 
-def array2nii(im, A, fnii, descrip=''):
+
+def array2nii(im, A, fnii, descrip='', trnsp=(), flip=(), storage_as=[]):
     '''Store the numpy array 'im' to a NIfTI file 'fnii'.
     ----
     Arguments:
-        'im': image to be stored in NIfTI
-        'A': affine transformation
-        'fnii': NIfTI file name.
-        'descrip': the description given to the file
+        'im':       image to be stored in NIfTI
+        'A':        affine transformation
+        'fnii':     output NIfTI file name.
+        'descrip':  the description given to the file
+        'trsnp':    transpose/permute the dimensions.
+                    In NIfTI it has to be in this order: [x,y,z,t,...])
+        'flip':     flip tupple for flipping the direction of x,y,z axes. 
+                    (1: no flip, -1: flip)
+        'storage_as': uses the flip and displacement as given by the following
+                    NifTI dictionary, obtained using
+                    nimpa.getnii(filepath, output='all').
     '''
 
-    if im.ndim==3:
-        im = np.transpose(im, (2, 1, 0))
-    elif im.ndim==4:
-        im = np.transpose(im, (3, 2, 1, 0))
+    if not len(trnsp) in [0,3,4] and not len(flip) in [0,3]:
+        raise ValueError('e> number of flip and/or transpose elements is incorrect.')
+
+    #---------------------------------------------------------------------------
+    #> TRANSLATIONS and FLIPS
+    #> get the same geometry as the input NIfTI file in the form of dictionary,
+    #>>as obtained from getnii(..., output='all')
+
+    #> permute the axis order in the image array
+    if isinstance(storage_as, dict) and 'transpose' in storage_as \
+            and 'flip' in storage_as:
+
+        trnsp = (storage_as['transpose'].index(0),
+                 storage_as['transpose'].index(1),
+                 storage_as['transpose'].index(2))
+
+        flip = storage_as['flip']
+    
+
+    if trnsp==():
+        im = im.transpose()
+    #> check if the image is 4D (dynamic) and modify as needed
+    elif len(trnsp)==3 and im.ndim==4:
+        trnsp = tuple([t+1 for t in trnsp] + [0])
+        im = im.transpose(trnsp)
     else:
-        raise StandardError('unrecognised image dimensions')
+        im = im.transpose(trnsp)
+    
+
+    #> perform flip of x,y,z axes after transposition into proper NIfTI order
+    if flip!=() and len(flip)==3:
+        im = im[::-flip[0], ::-flip[1], ::-flip[2], ...]
+    #---------------------------------------------------------------------------
 
     nii = nib.Nifti1Image(im, A)
     hdr = nii.header
@@ -121,6 +185,8 @@ def array2nii(im, A, fnii, descrip=''):
     hdr['cal_min'] = np.min(im)
     hdr['descrip'] = descrip
     nib.save(nii, fnii)
+
+
 
 def orientnii(imfile):
     '''Get the orientation from NIfTI sform.  Not fully functional yet.'''
@@ -165,7 +231,38 @@ def nii_gzip(imfile, outpath=''):
     with gzip.open(fout, 'wb') as f:
         f.write(d)
     return fout
-#================================================================================
+#===============================================================================
+
+
+def pick_t1w(mri):
+    ''' Pick the MR T1w from the dictionary for MR->PET registration.
+    '''
+
+    if isinstance(mri, dict):
+        # check if NIfTI file is given
+        if 'T1N4' in mri and os.path.isfile(mri['T1N4']):
+            ft1w = mri['T1N4']
+        # or another bias corrected
+        elif 'T1bc' in mri and os.path.isfile(mri['T1bc']):
+            ft1w = mri['T1bc']
+        elif 'T1nii' in mri and os.path.isfile(mri['T1nii']):
+            ft1w = mri['T1nii']
+        elif 'T1DCM' in mri and os.path.exists(mri['MRT1W']):
+            # create file name for the converted NIfTI image
+            fnii = 'converted'
+            call( [rs.DCM2NIIX, '-f', fnii, mri['T1nii'] ] )
+            ft1nii = glob.glob( os.path.join(mri['T1nii'], '*converted*.nii*') )
+            ft1w = ft1nii[0]
+        else:
+            print 'e> disaster: could not find a T1w image!'
+            return None
+            
+    else:
+        ('e> no correct input found for the T1w image')
+        return None
+
+    return ft1w
+
 
 def dcminfo(dcmvar, verbose=True):
     ''' Get basic info about the DICOM file/header.
@@ -174,8 +271,10 @@ def dcminfo(dcmvar, verbose=True):
     if isinstance(dcmvar, basestring):
         if verbose:
             print 'i> provided DICOM file:', dcmvar
-        dhdr = dcm.read_file(dcmvar)
+        dhdr = dcm.dcmread(dcmvar)
     elif isinstance(dcmvar, dict):
+        dhdr = dcmvar
+    elif isinstance(dcmvar, dcm.dataset.FileDataset):
         dhdr = dcmvar
 
     dtype   = dhdr[0x08, 0x08].value
@@ -251,7 +350,7 @@ def dcminfo(dcmvar, verbose=True):
         out = ['raw', 'physio', scanner_id]
 
     else:
-        out = ['unknown', cmmnt]
+        out = ['unknown', str(cmmnt.lower())]
 
     return out
 
@@ -522,90 +621,180 @@ def dcmsort(folder, copy_series=False, verbose=False):
                 srs[s]['files'].append( os.path.join(srsdir, f) )
             else:
                 srs[s]['files'].append( os.path.join(folder, f) )
-    #------------------------------------------------------
+
+    return srs
+#-------------------------------------------------------------------------------
 
 
 
 
-#================================================================================
+#===============================================================================
 
-def niisort(fims):
+def niisort(
+        fims,
+        memlim=True
+    ):
+
     ''' Sort all input NIfTI images and check their shape.
         Output dictionary of image files and their properties.
+        Options:
+            memlim -- when processing large numbers of frames the memory may
+            not be large enough.  memlim causes that the output does not contain
+            all the arrays corresponding to the images.
     '''
     # number of NIfTI images in folder
     Nim = 0
-    # sorting list (if frame number is present in the form '_frm-dd', where d is a digit)
+    # sorting list (if frame number is present in the form '_frm<dd>', where d is a digit)
     sortlist = []
-
-    # non dynamic frames input, assuming False (dynamic input)
-    ndf_flg = False
 
     for f in fims:
         if f.endswith('.nii') or f.endswith('.nii.gz'):
             Nim += 1
-            _match = re.search('(?<=_frm-)\d*', f)
+            _match = re.search('(?<=_frm)\d*', f)
             if _match:
-                sortlist.append(int(_match.group(0)))
+                frm = int(_match.group(0))
+                freelists = [frm not in l for l in sortlist]
+                listidx = [i for i,f in enumerate(freelists) if f]
+                if listidx:
+                    sortlist[listidx[0]].append(frm)
+                else:
+                    sortlist.append([frm])
             else:
-                sortlist.append(None)
-    notfrm = [e==None for e in sortlist]
-    if any(notfrm):
-        print 'w> only some images may be dynamic frames.'
-    if all(notfrm):
-        print 'w> none image is a dynamic frame.'
+                sortlist.append([None])
+
+    if len(sortlist)>1:
+        # if more than one dynamic set is given, the dynamic mode is cancelled.
+        dyn_flg = False
         sortlist = range(Nim)
-        ndf_flg = True
+    elif len(sortlist)==1:
+        dyn_flg = True
+        sortlist = sortlist[0]
+    else:
+        raise ValueError('e> niisort input error.')
+        
+    
     # number of frames (can be larger than the # images)
     Nfrm = max(sortlist)+1
     # sort the list according to the frame numbers
     _fims = ['Blank']*Nfrm
     # list of NIfTI image shapes and data types used
     shape = []
-    dtype = []
+    datype = []
     _nii = []
     for i in range(Nim):
-        if not notfrm[i]:
+        if dyn_flg:
             _fims[sortlist[i]] = fims[i]
             _nii = nib.load(fims[i])
-            dtype.append(_nii.get_data_dtype()) 
+            datype.append(_nii.get_data_dtype()) 
             shape.append(_nii.shape)
-        elif ndf_flg:
+        else:
             _fims[i] = fims[i]
             _nii = nib.load(fims[i])
-            dtype.append(_nii.get_data_dtype()) 
+            datype.append(_nii.get_data_dtype()) 
             shape.append(_nii.shape)
 
     # check if all images are of the same shape and data type
     if _nii and not shape.count(_nii.shape)==len(shape):
         raise ValueError('Input images are of different shapes.')
-    if _nii and not dtype.count(_nii.get_data_dtype())==len(dtype):
+    if _nii and not datype.count(_nii.get_data_dtype())==len(datype):
         raise TypeError('Input images are of different data types.')
     # image shape must be 3D
     if _nii and not len(_nii.shape)==3:
         raise ValueError('Input image(s) must be 3D.')
 
-    # get the images into an array
-    _imin = np.zeros((Nfrm,)+_nii.shape[::-1], dtype=_nii.get_data_dtype())
-    for i in range(Nfrm):
-        if i in sortlist:
-            imdic = getnii(_fims[i], output='all')
-            _imin[i,:,:,:] = imdic['im']
-            affine = imdic['affine']
-
-    # return a dictionary
-    return {'shape':_nii.shape[::-1],
+    out = {'shape':_nii.shape[::-1],
             'files':_fims, 
             'sortlist':sortlist,
-            #'im':_imin[:Nim-sum(notfrm),:,:,:],
-            'im':_imin[:Nfrm,:,:,:],
-            'affine':affine,
             'dtype':_nii.get_data_dtype(), 
             'N':Nim}
 
+    if memlim and Nfrm>50:
+        imdic = getnii(_fims[0], output='all')
+        affine = imdic['affine']
+    else:
+        # get the images into an array
+        _imin = np.zeros((Nfrm,)+_nii.shape[::-1], dtype=_nii.get_data_dtype())
+        for i in range(Nfrm):
+            if i in sortlist:
+                imdic = getnii(_fims[i], output='all')
+                _imin[i,:,:,:] = imdic['im']
+                affine = imdic['affine']
+        out['im'] = _imin[:Nfrm,:,:,:]
+
+    out['affine'] = affine
+
+    return out
+
 
 #================================================================================
+def dcm2nii(
+        dcmpth,
+        fimout = '',
+        fprefix = 'converted-from-DICOM_',
+        fcomment = '',
+        outpath = '',
+        timestamp = True,
+        executable = '',
+        force = False,
+    ):
+    ''' Convert DICOM files in folder (indicated by <dcmpth>) using DCM2NIIX
+        third-party software.
+    '''
 
+    # skip conversion if the output already exists and not force is selected
+    if os.path.isfile(fimout) and not force:
+        return fimout
+
+    if executable=='':
+        try:
+            import resources
+            executable = resources.DCM2NIIX
+        except:
+            raise NameError('e> could not import resources \
+                    or find variable DCM2NIIX in resources.py')
+    elif not os.path.isfile(executable):
+        raise IOError('e> the executable is incorrect!')
+
+    if not os.path.isdir(dcmpth):
+        raise IOError('e> the provided DICOM path is not a folder!')
+
+    #> output path
+    if outpath=='' and fimout!='' and '/' in fimout:
+        opth = os.path.dirname(fimout)
+        if opth=='':
+            opth = dcmpth
+        fimout = os.path.basename(fimout)
+
+    elif outpath=='':
+        opth = dcmpth
+
+    else:
+        opth = outpath
+
+    create_dir(opth)
+
+    if fimout=='':
+        fimout = fprefix
+        if timestamp:
+            fimout += time_stamp(simple_ascii=True)
+
+    fimout = fimout.split('.nii')[0]
+
+
+    # convert the DICOM mu-map images to nii
+    call([executable, '-f', fimout, '-o', opth, dcmpth])
+
+    fniiout = glob.glob( os.path.join(opth, '*'+fimout+'*.nii*') )
+
+    if fniiout:
+        return fniiout[0]
+    else:
+        raise ValueError('e> could not get the output file!')
+
+
+
+
+#================================================================================
 def dcm2im(fpth):
     ''' Get the DICOM files from 'fpth' into an image with the affine transformation.
         fpth can be a list of DICOM files or a path (string) to the folder with DICOM files.
@@ -616,7 +805,7 @@ def dcm2im(fpth):
     
     # case when given a folder path
     if isinstance(fpth, basestring) and os.path.isdir(fpth):
-        SZ0 = len([d for d in os.listdir(fpth) if d.endswith(".dcm")])
+        SZ0 = len([d for d in os.listdir(fpth) if d.endswith(ext)])
         # list of DICOM files
         fdcms = os.listdir(fpth)
         fdcms = [os.path.join(fpth,f) for f in fdcms if f.endswith(ext)]
