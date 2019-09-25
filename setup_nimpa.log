@@ -1,0 +1,14 @@
+running develop
+running egg_info
+writing requirements to nimpa.egg-info/requires.txt
+writing nimpa.egg-info/PKG-INFO
+writing top-level names to nimpa.egg-info/top_level.txt
+writing dependency_links to nimpa.egg-info/dependency_links.txt
+reading manifest file 'nimpa.egg-info/SOURCES.txt'
+reading manifest template 'MANIFEST.in'
+writing manifest file 'nimpa.egg-info/SOURCES.txt'
+running build_ext
+Creating /home2/jjlee/anaconda3/envs/py2/lib/python2.7/site-packages/nimpa.egg-link (link to .)
+Adding nimpa 1.1.16 to easy-install.pth file
+
+Installed /home2/jjlee/Docker/NiftyPETd/NIMPA
